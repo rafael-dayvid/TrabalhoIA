@@ -1,120 +1,211 @@
-# Autores: Pedro Henrique Siqueira de Paula Peixoto,
-#          Rafael Dayvid de Melo Freitas,
-#          Thales Henrique Marques Lázaro,
-#          Vinícius Duarte de Carvalho.
+"""
+Autores: Pedro Henrique Siqueira de Paula Peixoto,
+         Rafael Dayvid de Melo Freitas,
+         Thales Henrique Marques Lázaro,
+         Vinícius Duarte de Carvalho.
 
-# Pega os microdados dos ENEM de 2022 e 2023 e processa eles, excluindo pessoas que não estiveram presentes em algum dia da prova, 
-# também tirou as que tiverem a nota da redação zerada ou ausente, e por fim os treineiros, mantendo, 
-# número de inscrição, faixa etária, sexo, cor/raça, tipo da escola que estudou e as 25 questões socioeconômicas,
-# cria as colunas das faixas de sálario per capita minima e máxima usando a faixa de salários da família e quantidade de membros 
-# salva tudo no mesmo arquivo csv (enem_treino.csv), junto com uma nova coluna do ano de origem da linha.
+Processamento dos Microdados do ENEM (2022/2023) com arquivo CSV final reestruturado e ordenado.
+"""
 
+import argparse
+import string
 import sys
-
-import pandas as pd 
+from typing import NamedTuple
 import numpy as np
+import pandas as pd
 
-ARQUIVOS = {
+# -----------------------------------------------------------------------------
+# CONFIGURAÇÕES E CONSTANTES
+# -----------------------------------------------------------------------------
+
+ARQUIVOS_PADRAO = {
     2022: "MICRODADOS_ENEM_2022.csv",
     2023: "MICRODADOS_ENEM_2023.csv",
 }
-if len(sys.argv) == 3:
-    ARQUIVOS = {2022: sys.argv[1], 2023: sys.argv[2]}
 
-# Colunas que vão para o arquivo final
-COLUNAS = (
-    ["NU_INSCRICAO", "TP_FAIXA_ETARIA", "TP_SEXO", "TP_COR_RACA", "TP_ESCOLA"]
-    + [f"Q{i:03d}" for i in range(1, 26)]   # questões socioeconômicas Q001 a Q025
+# Questões socioeconômicas Q001 a Q025
+COLUNAS_QUESTOES = [f"Q{i:03d}" for i in range(1, 26)]
+
+# Colunas brutas a serem lidas do CSV do Inep
+COLUNAS_DEMOGRAFICAS = ["NU_INSCRICAO", "TP_FAIXA_ETARIA", "TP_SEXO", "TP_COR_RACA", "TP_ESCOLA"]
+COLUNAS = COLUNAS_DEMOGRAFICAS + COLUNAS_QUESTOES
+
+COLUNAS_FILTRO = [
+    "IN_TREINEIRO",
+    "NU_NOTA_REDACAO",
+    "TP_PRESENCA_CN",
+    "TP_PRESENCA_CH",
+    "TP_PRESENCA_LC",
+    "TP_PRESENCA_MT",
+]
+
+# ORDENAÇÃO FINAL DAS COLUNAS NO CSV DE SAÍDA
+COLUNAS_ORDENADAS_SAIDA = (
+    ["NU_INSCRICAO", "NU_ANO"]                  # Bloco 1: Identificação
+    + COLUNAS_DEMOGRAFICAS[1:]                   # Bloco 2: Perfil do Participante
+    + ["SAL_PER_CAPITA_MIN", "SAL_PER_CAPITA_MAX"] # Bloco 3: Renda Per Capita Calculada
+    + COLUNAS_QUESTOES                           # Bloco 4: Questionário Socioeconômico (Q001-Q025)
 )
 
-# Filtro: só quem fez todas as provas e a redação, e não é treineiro, se True, as colunas usadas no filtro são lidas, mas não vão para o arquivo final
-FILTRAR_PARTICIPANTES = True
-COLUNAS_FILTRO = ["IN_TREINEIRO", "NU_NOTA_REDACAO","TP_PRESENCA_CN", "TP_PRESENCA_CH", "TP_PRESENCA_LC", "TP_PRESENCA_MT"]
-
-SALARIO_MINIMO = {2022: 1212.00, 2023: 1320.00}
-
-LIMITES_RENDA = {
-    2022: [1212, 1818, 2424, 3030, 3636, 4848, 6060, 7272, 8484, 9696,
-           10908, 12120, 14544, 18180, 24240],
-    2023: [1320, 1980, 2640, 3300, 3960, 5280, 6600, 7920, 9240, 10560,
-           11880, 13200, 15840, 19800, 26400],
+SALARIO_MINIMO = {
+    2022: 1212.00,
+    2023: 1320.00,
 }
 
-SAIDA = "enem_treino.csv" 
+LIMITES_RENDA = {
+    2022: [1212, 1818, 2424, 3030, 3636, 4848, 6060, 7272, 8484, 9696, 10908, 12120, 14544, 18180, 24240],
+    2023: [1320, 1980, 2640, 3300, 3960, 5280, 6600, 7920, 9240, 10560, 11880, 13200, 15840, 19800, 26400],
+}
 
-SEP, ENCODING = ";", "latin-1"   # formato dos microdados do Inep
+SAIDA = "enem_treino.csv"
+SEP, ENCODING = ";", "latin-1"
+CHUNK_SIZE = 200_000
 
-def montar_faixas(limites):
-    # Devolve letra: (mínimo, máximo) em R$. O mínimo de cada faixa é o teto da anterior A -> (0, 0). Q -> (último teto, NaN), porque 'acima de X' não tem limite máximo
-    faixas = {"A": (0.0, 0.0)}
-    inferior = 0.0
-    for letra, teto in zip("BCDEFGHIJKLMNOP", limites):
-        faixas[letra] = (inferior, float(teto))
-        inferior = float(teto)
-    faixas["Q"] = (inferior, np.nan)
-    return faixas
 
-def criar_renda_per_capita(df, ano):
-    # Cria SAL_PER_CAPITA_MIN e SAL_PER_CAPITA_MAX: a faixa de renda familiar em salários mínimos do ano, dividida pelo número de pessoas da casa
+# -----------------------------------------------------------------------------
+# ESTRUTURA E CRIAÇÃO DAS FAIXAS DE RENDA
+# -----------------------------------------------------------------------------
+
+class IntervaloRenda(NamedTuple):
+    minimo: float
+    maximo: float
+
+
+def construir_tabela_faixas(ano: int) -> dict[str, IntervaloRenda]:
+    limites = LIMITES_RENDA[ano]
+    letras_intermediarias = string.ascii_uppercase[1:16]  # Letras 'B' até 'P'
+    
+    tabela_faixas = {"A": IntervaloRenda(minimo=0.0, maximo=0.0)}
+    piso_atual = 0.0
+
+    for letra, teto in zip(letras_intermediarias, limites):
+        teto_float = float(teto)
+        tabela_faixas[letra] = IntervaloRenda(minimo=piso_atual, maximo=teto_float)
+        piso_atual = teto_float
+
+    tabela_faixas["Q"] = IntervaloRenda(minimo=piso_atual, maximo=np.nan)
+    return tabela_faixas
+
+
+def exibir_tabela_faixas(ano: int) -> None:
     sm = SALARIO_MINIMO[ano]
-    faixas = montar_faixas(LIMITES_RENDA[ano])
-    minimo = df["Q006"].map({k: v[0] for k, v in faixas.items()})
-    maximo = df["Q006"].map({k: v[1] for k, v in faixas.items()})
-    pessoas = pd.to_numeric(df["Q005"], errors="coerce")
-    pessoas = pessoas.where(pessoas > 0)   # 0 ou negativo vira ausente
- 
-    df["SAL_PER_CAPITA_MIN"] = (minimo / sm / pessoas).round(4)
-    df["SAL_PER_CAPITA_MAX"] = (maximo / sm / pessoas).round(4)
+    tabela = construir_tabela_faixas(ano)
+    
+    print(f"\n{'='*65}")
+    print(f" TABELA DE FAIXAS DE RENDA - ENEM {ano} (Salário Mínimo: R$ {sm:,.2f})")
+    print(f"{'='*65}")
+    print(f"{'Letra':<6} | {'Piso (R$)':<12} | {'Teto (R$)':<14} | {'Em Salários Mínimos (SM)'}")
+    print(f"{'-'*65}")
+
+    for letra, faixa in tabela.items():
+        min_sm = faixa.minimo / sm
+        if np.isnan(faixa.maximo):
+            teto_str = "Sem limite"
+            sm_str = f"Acima de {min_sm:.1f} SM"
+        else:
+            max_sm = faixa.maximo / sm
+            teto_str = f"R$ {faixa.maximo:,.2f}"
+            sm_str = f"{min_sm:.1f} a {max_sm:.1f} SM"
+
+        print(f" {letra:<5} | R$ {faixa.minimo:<9,.2f} | {teto_str:<14} | {sm_str}")
+    print(f"{'='*65}\n")
+
+
+def calcular_renda_per_capita(df: pd.DataFrame, ano: int) -> pd.DataFrame:
+    sm = SALARIO_MINIMO[ano]
+    tabela_faixas = construir_tabela_faixas(ano)
+
+    mapa_minimo = {letra: faixa.minimo for letra, faixa in tabela_faixas.items()}
+    mapa_maximo = {letra: faixa.maximo for letra, faixa in tabela_faixas.items()}
+
+    renda_minima_familia = df["Q006"].map(mapa_minimo)
+    renda_maxima_familia = df["Q006"].map(mapa_maximo)
+
+    num_moradores = pd.to_numeric(df["Q005"], errors="coerce")
+    num_moradores = num_moradores.where(num_moradores > 0)
+
+    df["SAL_PER_CAPITA_MIN"] = (renda_minima_familia / sm / num_moradores).round(4)
+    df["SAL_PER_CAPITA_MAX"] = (renda_maxima_familia / sm / num_moradores).round(4)
+
     return df
 
-def ler_colunas(caminho, colunas): 
-    # vai ler as colunas,e se faltar alguma ele avisa
-    cabecalho = pd.read_csv(caminho, sep=SEP, encoding=ENCODING, nrows=0).columns
-    faltando = [c for c in colunas if c not in cabecalho]
+
+# -----------------------------------------------------------------------------
+# PROCESSAMENTO DE DADOS EM LOTES
+# -----------------------------------------------------------------------------
+
+def processar_microdados(ano: int, caminho_csv: str, eh_primeiro_bloco: bool) -> int:
+    cols_leitura = COLUNAS + COLUNAS_FILTRO
+
+    cabecalho = pd.read_csv(caminho_csv, sep=SEP, encoding=ENCODING, nrows=0).columns
+    faltando = [c for c in cols_leitura if c not in cabecalho]
     if faltando:
-        raise ValueError(f"Colunas não encontradas em {caminho}: {faltando}")
-    return pd.read_csv(caminho, sep=SEP, encoding=ENCODING, usecols=colunas)
+        raise ValueError(f"Colunas não encontradas em {caminho_csv}: {faltando}")
+
+    exibir_tabela_faixas(ano)
+
+    total_lidas = 0
+    total_salvas = 0
+
+    for chunk in pd.read_csv(caminho_csv, sep=SEP, encoding=ENCODING, usecols=cols_leitura, chunksize=CHUNK_SIZE):
+        total_lidas += len(chunk)
+
+        # Filtros de presença, redação válida e não-treineiro
+        presentes = (chunk[["TP_PRESENCA_CN", "TP_PRESENCA_CH", "TP_PRESENCA_LC", "TP_PRESENCA_MT"]] == 1).all(axis=1)
+        redacao_valida = chunk["NU_NOTA_REDACAO"].notna() & (chunk["NU_NOTA_REDACAO"] > 0)
+        nao_treineiros = chunk["IN_TREINEIRO"] == 0
+
+        chunk_filtrado = chunk[presentes & redacao_valida & nao_treineiros].copy()
+
+        if chunk_filtrado.empty:
+            continue
+
+        # Inserção do ano e cálculo da renda per capita
+        chunk_filtrado["NU_ANO"] = ano
+        chunk_filtrado = calcular_renda_per_capita(chunk_filtrado, ano)
+
+        # Formatação de tipo para garantir inteiros limpos no CSV
+        chunk_filtrado["Q005"] = pd.to_numeric(chunk_filtrado["Q005"], errors="coerce").astype("Int64")
+
+        # Reordenação estruturada das colunas de saída
+        chunk_estruturado = chunk_filtrado[COLUNAS_ORDENADAS_SAIDA].copy()
+
+        # Gravação no CSV
+        modo = "w" if eh_primeiro_bloco else "a"
+        chunk_estruturado.to_csv(
+            SAIDA, 
+            sep=";", 
+            index=False, 
+            encoding="utf-8", 
+            mode=modo, 
+            header=eh_primeiro_bloco,
+            float_format="%.4f"
+        )
+
+        eh_primeiro_bloco = False
+        total_salvas += len(chunk_estruturado)
+
+    print(f"ENEM {ano}: {total_lidas:,} linhas lidas -> {total_salvas:,} salvas em {SAIDA}")
+    return total_salvas
 
 
-def processar(ano, caminho, primeiro): 
-    # separa as linhas uteis filtrando nesse primeiro momento, se a pessoa participou de todos os dias, se a redação não foi anulada e se não é treineiro
-    df = ler_colunas(caminho, COLUNAS + COLUNAS_FILTRO)
-    total = len(df)
- 
-    # Filtros: presente nas 4 provas, redação diferente de zero e não treineiro
-    presente = (df[["TP_PRESENCA_CN", "TP_PRESENCA_CH", "TP_PRESENCA_LC", "TP_PRESENCA_MT"]] == 1).all(axis=1)
-    redacao_ok = df["NU_NOTA_REDACAO"] > 0          # nota 0 ou ausente fica de fora
-    nao_treineiro = df["IN_TREINEIRO"] == 0
-    df = df[presente & redacao_ok & nao_treineiro].copy()
- 
-    # Renda per capita (em salários mínimos) a partir de Q006 e Q005
-    df = criar_renda_per_capita(df, ano)
- 
-    df = df[COLUNAS + ["SAL_PER_CAPITA_MIN", "SAL_PER_CAPITA_MAX"]].copy()
-    # Pandas lê Q005 como decimal (4.0); volta para inteiro (4)
-    df["Q005"] = pd.to_numeric(df["Q005"], errors="coerce").astype("Int64")
-    # Ano do ENEM, logo depois do número de inscrição (permite separar treino e teste depois)
-    df.insert(1, "NU_ANO", ano)
- 
-    # O primeiro ano cria o arquivo (com cabeçalho); os seguintes são acrescentados no fim
-    df.to_csv(SAIDA, sep=";", index=False, encoding="utf-8",
-              mode="w" if primeiro else "a", header=primeiro)
- 
-    print(f"ENEM {ano}: {total:,} linhas lidas -> {len(df):,} salvas em {SAIDA} ({len(df.columns)} colunas)\n")
-    return len(df)
-
-def mostrar_faixas(ano):
-    #Imprime as faixas usadas (R$ e salários mínimos) para conferir com o dicionário
-    sm = SALARIO_MINIMO[ano]
-    print(f"Faixas de renda {ano} (salário mínimo R$ {sm:,.2f}):")
-    for letra, (mn, mx) in montar_faixas(LIMITES_RENDA[ano]).items():
-        teto = "sem limite" if np.isnan(mx) else f"R$ {mx:,.2f} = {mx / sm:g} SM"
-        print(f"  {letra}: de R$ {mn:,.2f} ({mn / sm:g} SM) até {teto}")
-    print("\n")
+# -----------------------------------------------------------------------------
+# EXECUÇÃO PRINCIPAL
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    total = 0
-    for i, (ano, caminho) in enumerate(ARQUIVOS.items()):
-        mostrar_faixas(ano)
-        total += processar(ano, caminho, primeiro=(i == 0))
-    print(f"\nArquivo final: {SAIDA} com {total:,} linhas")
+    parser = argparse.ArgumentParser(description="Processa microdados do ENEM 2022 e 2023.")
+    parser.add_argument("--path2022", type=str, default=ARQUIVOS_PADRAO[2022], help="Caminho do CSV de 2022")
+    parser.add_argument("--path2023", type=str, default=ARQUIVOS_PADRAO[2023], help="Caminho do CSV de 2023")
+    args = parser.parse_args()
+
+    arquivos = {2022: args.path2022, 2023: args.path2023}
+    total_linhas = 0
+    primeiro = True
+
+    for ano, caminho in arquivos.items():
+        total_linhas += processar_microdados(ano, caminho, eh_primeiro_bloco=primeiro)
+        primeiro = False
+
+    print(f"\nProcessamento concluído com sucesso!")
+    print(f"Arquivo final: {SAIDA} contendo {total_linhas:,} linhas.")
