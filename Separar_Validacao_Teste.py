@@ -1,73 +1,104 @@
-# Autores: Pedro Henrique Siqueira de Paula Peixoto,
-#          Rafael Dayvid de Melo Freitas,
-#          Thales Henrique Marques Lázaro,
-#          Vinícius Duarte de Carvalho.
+"""
+Autores: Pedro Henrique Siqueira de Paula Peixoto,
+         Rafael Dayvid de Melo Freitas,
+         Thales Henrique Marques Lázaro,
+         Vinícius Duarte de Carvalho.
 
-# Separa, do arquivo processado, dois grupos aleatórios e diferentes de linhas:
-#    Um para validação (enem_validacao.csv) e outro para teste (enem_teste.csv). As linhas sorteadas são retiradas do arquivo principal, que passa a ser a base de treino.
-# Lembrando o arquivo principal é sobrescrito (sem as linhas retiradas). Por isso o script se recusa a rodar de novo 
-# se o arquivo de validação ou de teste já existir, o que retiraria mais linhas por engano. Para refazer a separação, rode o pré-processamento
-# de novo (ele recria o arquivo principal completo) e apague os dois arquivos gerados.
+Divisão da base de dados do ENEM em Treino, Validação e Teste mantendo a estratificação.
+"""
 
+import argparse
 import os
 import sys
-
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
-PRINCIPAL = sys.argv[1] if len(sys.argv) > 1 else "enem_treino.csv"
-ENEM_VALIDACAO = "enem_validacao.csv"
-ENEM_TESTE = "enem_teste.csv"
-N_VALIDACAO = 200_000
-N_TESTE = 200_000
-SEMENTE = 42          # fixa o sorteio: rodando de novo com o mesmo arquivo, sai o mesmo resultado
-
-SEP = ";"
-# Colunas guardadas como "category" para gastar muito menos memória com 3,9 milhões de linhas
 CATEGORICAS = ["TP_SEXO"] + [f"Q{i:03d}" for i in range(1, 26) if i != 5]
+SEP = ";"
 
-
-def gravar(df, caminho):
+def gravar(df: pd.DataFrame, caminho: str) -> None:
     df.to_csv(caminho, sep=SEP, index=False, encoding="utf-8")
 
-
 def main():
-    for arq in (ENEM_VALIDACAO, ENEM_TESTE):
+    parser = argparse.ArgumentParser(description="Divide a base do ENEM em treino, validação e teste.")
+    parser.add_argument("--principal", type=str, default="enem_treino.csv", help="Caminho da base principal")
+    parser.add_argument("--validacao", type=str, default="enem_validacao.csv", help="Caminho da base de validação")
+    parser.add_argument("--teste", type=str, default="enem_teste.csv", help="Caminho da base de teste")
+    parser.add_argument("--n-val", type=int, default=200_000, help="Número de amostras para validação")
+    parser.add_argument("--n-test", type=int, default=200_000, help="Número de amostras para teste")
+    parser.add_argument("--semente", type=int, default=42, help="Semente aleatória (seed)")
+    
+    args = parser.parse_args()
+
+    # Trava de segurança contra re-execução
+    for arq in (args.validacao, args.teste):
         if os.path.exists(arq):
-            sys.exit(f" O arquivo {arq} já existe. A separação já foi feita; não rode de novo para não retirar mais linhas do arquivo principal (leia o aviso no topo do script).")
+            sys.exit(f"ERRO: O arquivo '{arq}' já existe. Apague os arquivos gerados caso queira refazer o split.")
 
+    if not os.path.exists(args.principal):
+        sys.exit(f"ERRO: O arquivo principal '{args.principal}' não foi encontrado.")
+
+    # Tipagem para economia de memória
     dtypes = {c: "category" for c in CATEGORICAS}
-    dtypes["Q005"] = "Int64"   # inteiro que aceita vazio (evita 4 virar 4.0)
-    df = pd.read_csv(PRINCIPAL, sep=SEP, encoding="utf-8", dtype=dtypes)
+    dtypes["Q005"] = "Int64"
+    if "NU_ANO" in dtypes:
+        dtypes["NU_ANO"] = "int16"
+
+    print(f"Lendo {args.principal}...")
+    df = pd.read_csv(args.principal, sep=SEP, encoding="utf-8", dtype=dtypes)
     total = len(df)
-    if total <= N_VALIDACAO + N_TESTE:
-        sys.exit(f"O arquivo tem só {total:,} linhas, pouco para tirar "
-                 f"{N_VALIDACAO:,} + {N_TESTE:,}.")
-    print(f"{PRINCIPAL}: {total:,} linhas\n")
+    
+    n_total_solicitado = args.n_val + args.n_test
+    if total <= n_total_solicitado:
+        sys.exit(f"ERRO: O arquivo tem {total:,} linhas, insuficiente para retirar {args.n_val:,} + {args.n_test:,}.")
 
-    # Validação: sorteio entre todas as linhas
-    validacao = df.sample(n=N_VALIDACAO, random_state=SEMENTE)
-    df = df.drop(index=validacao.index)
-    gravar(validacao, ENEM_VALIDACAO)
-    print(f"Validação: {len(validacao):,} linhas -> {ENEM_VALIDACAO} "
-          f"(restam {len(df):,} no principal)\n")
+    print(f"Base carregada: {total:,} linhas.\n")
 
-    # Teste: sorteio só entre as linhas que sobraram
-    teste = df.sample(n=N_TESTE, random_state=SEMENTE)
-    df = df.drop(index=teste.index)
-    gravar(teste, ENEM_TESTE)
-    print(f"Teste: {len(teste):,} linhas -> {ENEM_TESTE} (restam {len(df):,} no principal)\n")
+    # Amostragem Estratificada por 'NU_ANO' (se a coluna existir)
+    coluna_estratificacao = "NU_ANO" if "NU_ANO" in df.columns else None
 
-    # Atualiza o arquivo principal (grava num temporário e só então troca, para não perder o arquivo original se algo falhar no meio da gravação)
-    temporario = PRINCIPAL + ".tmp"
-    gravar(df, temporario)
-    os.replace(temporario, PRINCIPAL)
-    print(f"{PRINCIPAL} atualizado: {len(df):,} linhas (base de treino)\n")
+    # 1. Separa o grupo de Validação
+    frac_val = args.n_val / len(df)
+    df_restante, df_val = train_test_split(
+        df,
+        test_size=frac_val,
+        random_state=args.semente,
+        stratify=df[coluna_estratificacao] if coluna_estratificacao else None
+    )
 
-    # Conferência: nenhum aluno aparece em dois arquivos
-    ids = [set(validacao["NU_INSCRICAO"]), set(teste["NU_INSCRICAO"]), set(df["NU_INSCRICAO"])]
-    repetidos = len(ids[0] & ids[1]) + len(ids[0] & ids[2]) + len(ids[1] & ids[2])
-    print(f"Conferência: {repetidos} inscrições repetidas entre os três arquivos; "
-          f"soma das linhas = {len(validacao) + len(teste) + len(df):,} (original: {total:,})")
+    # 2. Separa o grupo de Teste
+    frac_test = args.n_test / len(df_restante)
+    df_treino, df_test = train_test_split(
+        df_restante,
+        test_size=frac_test,
+        random_state=args.semente,
+        stratify=df_restante[coluna_estratificacao] if coluna_estratificacao else None
+    )
+
+    # Gravação dos arquivos divididos
+    gravar(df_val, args.validacao)
+    print(f"Validação salvos: {len(df_val):,} linhas -> {args.validacao}")
+
+    gravar(df_test, args.teste)
+    print(f"Teste salvos: {len(df_test):,} linhas -> {args.teste}")
+
+    # Atualização da base principal (Treino) via escrita atômica
+    temporario = args.principal + ".tmp"
+    gravar(df_treino, temporario)
+    os.replace(temporario, args.principal)
+    print(f"Base principal atualizada (Treino): {len(df_treino):,} linhas -> {args.principal}\n")
+
+    # Conferência de integridade
+    set_val = set(df_val["NU_INSCRICAO"])
+    set_test = set(df_test["NU_INSCRICAO"])
+    set_treino = set(df_treino["NU_INSCRICAO"])
+
+    repetidos = len(set_val & set_test) + len(set_val & set_treino) + len(set_test & set_treino)
+    soma_linhas = len(df_val) + len(df_test) + len(df_treino)
+
+    print(f"--- Conferência ---")
+    print(f"Inscrições repetidas: {repetidos}")
+    print(f"Soma das linhas geradas: {soma_linhas:,} (Original: {total:,})")
 
 if __name__ == "__main__":
     main()
